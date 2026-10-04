@@ -1,0 +1,36 @@
+name: SenDo
+options:
+  bundleIdPrefix: com.sendo
+  deploymentTarget:
+    macOS: "14.0"
+  xcodeVersion: "15.0"
+  generateEmptyDirectories: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+
+targets:
+  SenDo:
+    type: application
+    platform: macOS
+    sources:
+      - path: SenDo/SenDo
+        type: group
+        buildPhase: sources
+    settings:
+      base:
+        INFOPLIST_FILE: SenDo/Info.plist
+        CODE_SIGN_ENTITLEMENTS: SenDo/SenDo.entitlements
+        PRODUCT_NAME: SenDo
+        PRODUCT_BUNDLE_IDENTIFIER: com.sendo.app
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_ALLOWED: NO
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
+        SWIFT_OBJC_BRIDGING_HEADER: SenDo/SenDo/SenDo-Bridging-Header.h
+    dependencies:
+      - sdk: IOKit.framework
+      - sdk: CoreFoundation.framework
