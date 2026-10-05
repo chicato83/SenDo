@@ -33,6 +33,46 @@ final class SphairaClient: @unchecked Sendable {
     private let device: USBDevice
     private let transfer: USBTransfer
 
+    // MARK: Limits
+
+    /// Longest Switch-supplied export path we are willing to read, in bytes.
+    /// `pathLength` arrives as a raw `UInt32` and `readExact` zero-fills its
+    /// whole buffer, so an unbounded value would let the Switch make us
+    /// allocate up to 4 GiB in a single call (W2).
+    private static let maxExportPathLength = 4096
+    /// Largest export chunk we buffer, in bytes. Sphaira sends 4 MiB chunks
+    /// (`NORMAL_BUFFER_SIZE` in `threaded_file_transfer.cpp`), so 64 MiB is a
+    /// wide margin above anything legitimate (W2).
+    private static let maxExportChunkSize = 64 * 1024 * 1024
+    /// Chunk size used when draining announced-but-rejected bytes.
+    private static let drainChunkSize = 64 * 1024
+    /// Distinct rejection keys kept for first-seen logging.
+    private static let maxTrackedRejections = 128
+
+    // MARK: Rejection accounting
+
+    /// Rejection counter per key — the Switch-supplied path when we have one,
+    /// a synthetic key otherwise. Only the FIRST rejection of a key is logged:
+    /// a rejected path makes the dumper retry at USB speed, and logging every
+    /// attempt would flood the log (W4).
+    private var rejectionCounts: [String: Int] = [:]
+    private var totalRejections = 0
+
+    /// Records a rejected export, logging the first sighting of `key` and
+    /// counting every repeat silently (with a periodic aggregate).
+    private func recordExportRejection(_ key: String, reason: String) {
+        totalRejections += 1
+        if let seen = rejectionCounts[key] {
+            rejectionCounts[key] = seen + 1
+        } else if rejectionCounts.count < Self.maxTrackedRejections {
+            rejectionCounts[key] = 1
+            SenDoLog.log("SphairaClient: rejected export \"\(key)\" — \(reason) (further rejections of this key are counted silently)")
+        }
+        if totalRejections % 100 == 0 {
+            SenDoLog.log("SphairaClient: export rejections so far: \(totalRejections)")
+        }
+    }
+
     init(device: USBDevice) throws {
         SenDoLog.log("SphairaClient: running protocol self-test...")
         guard SPHPacket.runSelfTest() else {
@@ -64,15 +104,36 @@ final class SphairaClient: @unchecked Sendable {
     ///
     /// Serves `files` (local Mac paths) for install, and `backupRoot` as the
     /// destination root for export. Reports progress per chunk in both modes.
+    ///
+    /// `files` is read WHEN the handshake latches INSTALL mode, not when the
+    /// session starts: a session stays alive across the Switch's idle gaps
+    /// (the caller restarts it), so a snapshot taken minutes earlier would
+    /// publish a stale string table.
+    ///
+    /// `onHandshake` receives exactly that latched list (called on the serving
+    /// thread), so the caller can tell which queued items this session is
+    /// actually able to transfer — an item queued AFTER the latch will only be
+    /// served by the NEXT session, and must not be reported as done by this one.
     func serve(
-        files: [URL],
+        files: InstallFileList,
         backupRoot: URL,
-        onProgress: @escaping (_ bytesSent: Int64, _ totalBytes: Int64, _ currentFileName: String) -> Void,
+        onHandshake: (([URL]) -> Void)? = nil,
+        onProgress: @escaping (_ bytesSent: Int64, _ totalBytes: Int64, _ currentFilePath: String) -> Void,
         onExportProgress: @escaping (_ bytesReceived: Int64, _ currentFileName: String) -> Void
     ) throws {
         // The Switch speaks first. Wait for it.
         SenDoLog.log("SphairaClient: waiting for the session-opening SendPacket from Switch...")
-        let first = try transfer.readPacket(timeout: 15)
+        let first: SPHPacket
+        do {
+            first = try transfer.readPacket(timeout: 15)
+        } catch let error as USBTransferError {
+            guard case .timeout(let seconds) = error else { throw error }
+            // The Switch never started a session — the normal state between
+            // two of them. Reported as `sessionIdle`, never as a failure, so
+            // the caller does not raise "the Switch stopped responding".
+            SenDoLog.log("SphairaClient: no session-opening packet within \(seconds)s — session idle, closing")
+            throw SphairaProtocolError.sessionIdle
+        }
         SenDoLog.log(
             String(
                 format: "SphairaClient: session packet — arg2(cmd)=0x%08X arg3=0x%08X arg4=0x%08X",
@@ -82,7 +143,7 @@ final class SphairaClient: @unchecked Sendable {
 
         switch first.arg2 {
         case SPHProtocol.CMD_QUIT:
-            try serveInstall(files: files, onProgress: onProgress)
+            try serveInstall(files: files, onHandshake: onHandshake, onProgress: onProgress)
         case SPHProtocol.CMD_EXPORT:
             try serveExportLoop(firstHeader: first, backupRoot: backupRoot, onExportProgress: onExportProgress)
         default:
@@ -97,18 +158,24 @@ final class SphairaClient: @unchecked Sendable {
     /// Install handshake + command loop. Unchanged behaviour, only reached now
     /// after the mode has been latched from the first packet.
     private func serveInstall(
-        files: [URL],
-        onProgress: @escaping (_ bytesSent: Int64, _ totalBytes: Int64, _ currentFileName: String) -> Void
+        files: InstallFileList,
+        onHandshake: (([URL]) -> Void)?,
+        onProgress: @escaping (_ bytesSent: Int64, _ totalBytes: Int64, _ currentFilePath: String) -> Void
     ) throws {
+        // Read the queue NOW, at handshake time: the session may have been
+        // started minutes before the user queued anything.
+        let servedFiles = files.current
+        onHandshake?(servedFiles)
+
         // Build the string table: UTF-8 file names joined by "\n" with a trailing "\n".
         // An empty list is valid — the Switch shows nothing and then sends CMD_QUIT.
         var stringTable = Data()
-        for file in files {
+        for file in servedFiles {
             stringTable.append(contentsOf: file.lastPathComponent.utf8)
             stringTable.append(0x0A)  // "\n"
         }
-        SenDoLog.log("SphairaClient: INSTALL mode — serving \(files.count) file(s), string table = \(stringTable.count) bytes")
-        if files.isEmpty {
+        SenDoLog.log("SphairaClient: INSTALL mode — serving \(servedFiles.count) file(s), string table = \(stringTable.count) bytes")
+        if servedFiles.isEmpty {
             SenDoLog.log("SphairaClient: file list is EMPTY — Switch will show nothing and should send CMD_QUIT")
         }
 
@@ -132,7 +199,7 @@ final class SphairaClient: @unchecked Sendable {
             } else if cmd == SPHProtocol.CMD_OPEN {
                 let index = Int(packet.arg3)
                 SenDoLog.log("SphairaClient: received CMD_OPEN index=\(index) arg4=\(packet.arg4)")
-                try serveOpenFile(index: index, files: files, onProgress: onProgress)
+                try serveOpenFile(index: index, files: servedFiles, onProgress: onProgress)
             } else {
                 SenDoLog.log("SphairaClient: UNKNOWN command \(cmd) — sending RESULT_ERROR and stopping")
                 try? transfer.sendResult(SPHProtocol.RESULT_ERROR)
@@ -159,6 +226,11 @@ final class SphairaClient: @unchecked Sendable {
     ) throws {
         SenDoLog.log("SphairaClient: EXPORT mode — path length \(firstHeader.arg3), backup root \(backupRoot.path)")
         var pendingHeader: SPHPacket? = firstHeader
+        // Set as soon as one file of this session loses chunks. The Switch may
+        // still close the session cleanly afterwards, but what landed on disk
+        // is incomplete, so the session must end with an error instead of
+        // reporting success (W3).
+        var interrupted = false
 
         while true {
             let pathLength: Int
@@ -171,6 +243,10 @@ final class SphairaClient: @unchecked Sendable {
                 if header.arg2 == SPHProtocol.CMD_QUIT {
                     SenDoLog.log("SphairaClient: export session — CMD_QUIT, closing cleanly")
                     try transfer.sendResult(SPHProtocol.RESULT_OK)
+                    guard !interrupted else {
+                        SenDoLog.log("SphairaClient: export session ends after interrupted file(s) — reporting an error instead of success")
+                        throw SphairaProtocolError.exportInterrupted
+                    }
                     return
                 }
                 guard header.arg2 == SPHProtocol.CMD_EXPORT else {
@@ -191,11 +267,14 @@ final class SphairaClient: @unchecked Sendable {
             }
 
             defer { try? destination.handle.close() }
-            try receiveExportBody(
+            let clean = try receiveExportBody(
                 handle: destination.handle,
                 url: destination.url,
                 onExportProgress: onExportProgress
             )
+            if !clean {
+                interrupted = true
+            }
         }
     }
 
@@ -203,68 +282,180 @@ final class SphairaClient: @unchecked Sendable {
     /// parent directories and opens the destination for writing.
     /// Returns `nil` after answering `RESULT_ERROR`.
     private func receiveExportPath(pathLength: Int, backupRoot: URL) throws -> (url: URL, handle: FileHandle)? {
-        guard pathLength > 0 else {
-            SenDoLog.log("SphairaClient: export path length is 0 — sending RESULT_ERROR")
+        // Bound the announced length BEFORE readExact allocates it (W2): a raw
+        // UInt32 would otherwise let the Switch make us zero-fill up to 4 GiB.
+        guard pathLength > 0, pathLength <= Self.maxExportPathLength else {
+            let reason = pathLength > 0
+                ? "path length \(pathLength) exceeds \(Self.maxExportPathLength) bytes"
+                : "path length is not positive"
+            recordExportRejection("pathLength=\(pathLength)", reason: reason)
+            if pathLength > Self.maxExportPathLength {
+                // The header ack already authorised the Switch to send
+                // `pathLength` bytes: drain them in bounded chunks so the wire
+                // stays in sync rather than buffering them.
+                try drain(pathLength, timeout: 60)
+            }
             try transfer.sendResult(SPHProtocol.RESULT_ERROR)
             return nil
         }
 
         let rawBytes = try transfer.readExact(pathLength, timeout: 60)
         guard let rawPath = String(data: rawBytes, encoding: .utf8), !rawPath.isEmpty else {
-            SenDoLog.log("SphairaClient: export path is empty or not valid UTF-8 — sending RESULT_ERROR")
+            recordExportRejection("pathLength=\(pathLength)", reason: "path is empty or not valid UTF-8")
             try transfer.sendResult(SPHProtocol.RESULT_ERROR)
             return nil
         }
 
         // The path comes from the Switch: never trust it before sanitising.
-        guard let destination = resolveExportDestination(backupRoot: backupRoot, rawPath: rawPath) else {
-            SenDoLog.log("SphairaClient: rejected export path \"\(rawPath)\" — sending RESULT_ERROR")
+        let destination: URL
+        switch resolveExportDestination(backupRoot: backupRoot, rawPath: rawPath) {
+        case .rejected(let reason):
+            recordExportRejection(rawPath, reason: reason)
+            try transfer.sendResult(SPHProtocol.RESULT_ERROR)
+            return nil
+        case .accepted(let url):
+            destination = url
+        }
+
+        let opened: (url: URL, handle: FileHandle)
+        do {
+            opened = try openExportDestination(destination, backupRoot: backupRoot)
+        } catch {
+            recordExportRejection(rawPath, reason: "\(error)")
             try transfer.sendResult(SPHProtocol.RESULT_ERROR)
             return nil
         }
 
+        SenDoLog.log("SphairaClient: export destination \(opened.url.path)")
         do {
-            try FileManager.default.createDirectory(
-                at: destination.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            // Start clean: a previous partial export must not leave stale bytes
-            // beyond what this run writes.
-            if FileManager.default.fileExists(atPath: destination.path) {
-                try FileManager.default.removeItem(at: destination)
-            }
-            guard FileManager.default.createFile(atPath: destination.path, contents: nil) else {
-                SenDoLog.log("SphairaClient: failed to create \(destination.path) — sending RESULT_ERROR")
-                try transfer.sendResult(SPHProtocol.RESULT_ERROR)
-                return nil
-            }
-            let handle = try FileHandle(forWritingTo: destination)
-            SenDoLog.log("SphairaClient: export destination \(destination.path)")
             try transfer.sendResult(SPHProtocol.RESULT_OK)
-            return (destination, handle)
         } catch {
-            SenDoLog.log("SphairaClient: failed to open export destination \(destination.path): \(error)")
-            try? transfer.sendResult(SPHProtocol.RESULT_ERROR)
-            return nil
+            // The ack never reached the Switch: do not leak the open file.
+            try? opened.handle.close()
+            throw error
+        }
+        return opened
+    }
+
+    /// Result of resolving a Switch-supplied path against the backup root.
+    private enum ExportPathResolution {
+        case rejected(String)  // English reason, logged once per path
+        case accepted(URL)
+    }
+
+    /// Creates the parent directories of `destination`, re-checks containment
+    /// against the symlink-resolved backup root — the parents exist now, so
+    /// `resolvingSymlinksInPath()` cannot be fooled by a missing component —
+    /// and opens the leaf for writing.
+    private func openExportDestination(
+        _ destination: URL,
+        backupRoot: URL
+    ) throws -> (url: URL, handle: FileHandle) {
+        let parent = destination.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+
+        // C1: containment is decided by the REAL paths, not the standardised
+        // ones — `standardizedFileURL` folds `.`/`..` lexically but never
+        // resolves a symlink planted inside the backup folder.
+        let realRoot = backupRoot.resolvingSymlinksInPath().standardizedFileURL
+        guard realRoot.path != "/" else {
+            throw ExportDestinationError.backupRootIsFilesystemRoot
+        }
+        let realParent = parent.resolvingSymlinksInPath().standardizedFileURL
+        guard realParent.path == realRoot.path || realParent.path.hasPrefix(realRoot.path + "/") else {
+            throw ExportDestinationError.outsideRoot(parent: realParent.path, root: realRoot.path)
+        }
+
+        let finalURL = realParent.appendingPathComponent(destination.lastPathComponent)
+        guard finalURL.path != realRoot.path else {
+            throw ExportDestinationError.isBackupRoot(root: realRoot.path)
+        }
+        return (finalURL, try openRegularFileExclusively(at: finalURL))
+    }
+
+    /// Opens `url` for writing, refusing anything that is not a brand-new
+    /// regular file.
+    ///
+    /// `lstat` (never `stat`) decides, so an existing symlink, folder or
+    /// device is reported instead of followed; `O_EXCL | O_NOFOLLOW` closes
+    /// the gap between that check and the open, so the leaf can never be a
+    /// symlink. `unlink` runs only after `S_ISREG` held, so a Switch path that
+    /// names a folder can never trigger a recursive delete (C2).
+    private func openRegularFileExclusively(at url: URL) throws -> FileHandle {
+        let path = url.path
+        var info = stat()
+        if lstat(path, &info) == 0 {
+            guard info.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) else {
+                throw ExportDestinationError.notRegularFile(path: path)
+            }
+            // Left-over partial export of this same file: dropping a regular
+            // file is safe and keeps the receive buffer starting clean.
+            guard unlink(path) == 0 else {
+                throw ExportDestinationError.unlinkFailed(path: path, code: errno)
+            }
+        } else {
+            guard errno == ENOENT else {
+                throw ExportDestinationError.lstatFailed(path: path, code: errno)
+            }
+        }
+
+        let fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o644)
+        guard fd >= 0 else {
+            throw ExportDestinationError.openFailed(path: path, code: errno)
+        }
+
+        var opened = stat()
+        guard fstat(fd, &opened) == 0 else {
+            let code = errno
+            close(fd)
+            throw ExportDestinationError.openFailed(path: path, code: code)
+        }
+        guard opened.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) else {
+            close(fd)
+            throw ExportDestinationError.notRegularFile(path: path)
+        }
+        return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+    }
+
+    /// Reads and discards `count` bytes so the wire stays in sync after a
+    /// Switch-supplied length has been rejected. Never holds more than
+    /// `drainChunkSize` bytes at a time.
+    private func drain(_ count: Int, timeout: TimeInterval) throws {
+        var remaining = count
+        while remaining > 0 {
+            let chunk = min(remaining, Self.drainChunkSize)
+            _ = try transfer.readExact(chunk, timeout: timeout)
+            remaining -= chunk
         }
     }
 
     /// Resolves `rawPath` inside `backupRoot`.
     ///
-    /// Leading `/` are stripped, `.` and `..` components are rejected, and the
-    /// standardised result must still live under the standardised root — the
-    /// path arrives from the Switch, so a traversal attempt must never escape
-    /// the configured backup folder. Returns `nil` when the path is rejected.
-    private func resolveExportDestination(backupRoot: URL, rawPath: String) -> URL? {
-        let root = backupRoot.standardizedFileURL
+    /// The boundary is the symlink-resolved root: `.`/`..` components and
+    /// control bytes are rejected outright, the standardised result must still
+    /// live under that root, and every ancestor that already exists is
+    /// re-resolved so a symlink planted inside the backup folder is caught
+    /// BEFORE anything is created through it. Returns `.rejected` when the
+    /// path must not be used.
+    private func resolveExportDestination(backupRoot: URL, rawPath: String) -> ExportPathResolution {
+        let root = backupRoot.resolvingSymlinksInPath().standardizedFileURL
+        guard root.path != "/" else {
+            // Writing through a root that normalises to "/" would put the
+            // export anywhere on the machine — refuse instead.
+            return .rejected("backup root normalises to /")
+        }
+
         let components = rawPath.split(separator: "/").map(String.init)
         guard !components.isEmpty else {
-            SenDoLog.log("SphairaClient: export path \"\(rawPath)\" has no components")
-            return nil
+            return .rejected("path has no components")
         }
-        for component in components where component == "." || component == ".." {
-            SenDoLog.log("SphairaClient: export path \"\(rawPath)\" contains illegal component \"\(component)\"")
-            return nil
+        for component in components {
+            if component == "." || component == ".." {
+                return .rejected("illegal path component \"\(component)\"")
+            }
+            if component.unicodeScalars.contains(where: { $0.value < 0x20 }) {
+                return .rejected("path component contains control bytes")
+            }
         }
 
         var destination = root
@@ -273,12 +464,30 @@ final class SphairaClient: @unchecked Sendable {
         }
 
         let resolved = destination.standardizedFileURL
-        let rootPath = root.path
-        guard resolved.path == rootPath || resolved.path.hasPrefix(rootPath + "/") else {
-            SenDoLog.log("SphairaClient: export path resolves to \(resolved.path), outside backup root \(rootPath)")
-            return nil
+        guard resolved.path != root.path else {
+            return .rejected("path resolves to the backup root itself")
         }
-        return resolved
+        guard resolved.path.hasPrefix(root.path + "/") else {
+            return .rejected("path resolves to \(resolved.path), outside backup root \(root.path)")
+        }
+
+        // Every ancestor that already exists must still be inside the real
+        // root; missing ones are created (and re-checked) afterwards.
+        var cursor = root
+        for component in components.dropLast() {
+            cursor.appendPathComponent(component)
+            var info = stat()
+            guard lstat(cursor.path, &info) == 0 else { continue }
+            guard info.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
+                return .rejected("intermediate component \"\(component)\" is not a directory")
+            }
+            let real = cursor.resolvingSymlinksInPath().standardizedFileURL
+            guard real.path == root.path || real.path.hasPrefix(root.path + "/") else {
+                return .rejected("intermediate component \"\(component)\" resolves to \(real.path), outside backup root \(root.path)")
+            }
+        }
+
+        return .accepted(resolved)
     }
 
     /// Receives the chunk stream of one file until `SendDataPacket(0,0,0)`.
@@ -286,13 +495,19 @@ final class SphairaClient: @unchecked Sendable {
     /// Mirrors `tools/usb_export.py`: ack the header first, then read the
     /// payload, verify its CRC32C and only then ack the payload
     /// (`Usb::Write` does `SendAndVerify(packet)` then `SendAndVerify(payload)`).
+    ///
+    /// Returns `false` when this file lost chunks (CRC mismatch, oversized
+    /// announced size or a failed write): the terminator still ends the file
+    /// on the wire, but what landed on disk is incomplete and the caller must
+    /// not report the export as successful (W3).
     private func receiveExportBody(
         handle: FileHandle,
         url: URL,
         onExportProgress: @escaping (_ bytesReceived: Int64, _ currentFileName: String) -> Void
-    ) throws {
+    ) throws -> Bool {
         let fileName = url.lastPathComponent
         var bytesReceived: Int64 = 0
+        var hadError = false
 
         while true {
             let packet = try transfer.readPacket(timeout: 600)
@@ -306,8 +521,29 @@ final class SphairaClient: @unchecked Sendable {
 
             // End of this file.
             if offset == 0 && size == 0 {
-                SenDoLog.log("SphairaClient: end of export for \(fileName) after \(bytesReceived) bytes")
-                return
+                if hadError {
+                    SenDoLog.log("SphairaClient: end of export for \(fileName) after \(bytesReceived) bytes — at least one chunk was lost, the file is incomplete")
+                } else {
+                    SenDoLog.log("SphairaClient: end of export for \(fileName) after \(bytesReceived) bytes")
+                }
+                return !hadError
+            }
+
+            // Bound the announced size BEFORE readExact allocates it (W2): a
+            // raw UInt32 would otherwise let the Switch make us zero-fill up
+            // to 4 GiB for a single chunk.
+            guard size <= Self.maxExportChunkSize else {
+                recordExportRejection(
+                    "chunk \(fileName) size=\(size)",
+                    reason: "chunk size \(size) exceeds \(Self.maxExportChunkSize) bytes"
+                )
+                // The header is already acked, so the payload is on its way:
+                // drain it in bounded chunks and fail the payload ack instead
+                // of buffering it.
+                try drain(size, timeout: 300)
+                hadError = true
+                try transfer.sendResult(SPHProtocol.RESULT_ERROR)
+                continue
             }
 
             let payload = try transfer.readExact(size, timeout: 300)
@@ -320,6 +556,7 @@ final class SphairaClient: @unchecked Sendable {
                         offset, crc, expectedCRC
                     )
                 )
+                hadError = true
                 try transfer.sendResult(SPHProtocol.RESULT_ERROR)
                 continue
             }
@@ -329,6 +566,7 @@ final class SphairaClient: @unchecked Sendable {
                 try handle.write(contentsOf: payload)
             } catch {
                 SenDoLog.log("SphairaClient: write failed for \(fileName) at offset \(offset): \(error)")
+                hadError = true
                 try transfer.sendResult(SPHProtocol.RESULT_ERROR)
                 continue
             }
@@ -344,7 +582,7 @@ final class SphairaClient: @unchecked Sendable {
     private func serveOpenFile(
         index: Int,
         files: [URL],
-        onProgress: @escaping (_ bytesSent: Int64, _ totalBytes: Int64, _ currentFileName: String) -> Void
+        onProgress: @escaping (_ bytesSent: Int64, _ totalBytes: Int64, _ currentFilePath: String) -> Void
     ) throws {
         guard index >= 0 && index < files.count else {
             SenDoLog.log("SphairaClient: index \(index) out of range (0..<\(files.count)) — sending RESULT_ERROR")
@@ -384,11 +622,15 @@ final class SphairaClient: @unchecked Sendable {
     }
 
     /// Inner chunk loop: answer SendDataPacket requests until CloseFile (offset=0, size=0).
+    ///
+    /// `onProgress` carries the FULL path (not the bare file name) so the
+    /// caller can match the progress against a queued install by path instead
+    /// of by name — two games can share a `lastPathComponent`.
     private func transferChunkLoop(
         handle: FileHandle,
         url: URL,
         fileSize: Int64,
-        onProgress: @escaping (_ bytesSent: Int64, _ totalBytes: Int64, _ currentFileName: String) -> Void
+        onProgress: @escaping (_ bytesSent: Int64, _ totalBytes: Int64, _ currentFilePath: String) -> Void
     ) throws {
         let fileName = url.lastPathComponent
         var bytesSent: Int64 = 0
@@ -435,7 +677,7 @@ final class SphairaClient: @unchecked Sendable {
             try transfer.write(chunk)
 
             bytesSent += Int64(chunk.count)
-            onProgress(bytesSent, fileSize, fileName)
+            onProgress(bytesSent, fileSize, url.path)
         }
     }
 
@@ -460,5 +702,63 @@ final class SphairaClient: @unchecked Sendable {
         }
         let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
         return attributes?[.size] as? Int64
+    }
+}
+
+/// Rejections raised while opening the export destination.
+private enum ExportDestinationError: LocalizedError {
+    case backupRootIsFilesystemRoot
+    case isBackupRoot(root: String)
+    case outsideRoot(parent: String, root: String)
+    case notRegularFile(path: String)
+    case lstatFailed(path: String, code: Int32)
+    case unlinkFailed(path: String, code: Int32)
+    case openFailed(path: String, code: Int32)
+
+    var errorDescription: String? {
+        switch self {
+        case .backupRootIsFilesystemRoot:
+            return "backup root resolves to the filesystem root"
+        case .isBackupRoot(let root):
+            return "destination is the backup root itself (\(root))"
+        case .outsideRoot(let parent, let root):
+            return "parent resolves to \(parent), outside backup root \(root)"
+        case .notRegularFile(let path):
+            return "existing item at \(path) is not a regular file"
+        case .lstatFailed(let path, let code):
+            return "lstat failed for \(path) (errno \(code))"
+        case .unlinkFailed(let path, let code):
+            return "unlink failed for \(path) (errno \(code))"
+        case .openFailed(let path, let code):
+            return "open failed for \(path) (errno \(code))"
+        }
+    }
+}
+
+/// The install queue, shared between the view-model (which mutates it on the
+/// main actor) and the serving loop (which reads it at handshake time).
+///
+/// A session stays alive across the Switch's idle gaps, so a `[URL]` snapshot
+/// taken when the session started would go stale the moment the user queued a
+/// game. This box hands the serving loop the CURRENT list every handshake
+/// without letting it race the main-actor queue.
+final class InstallFileList: @unchecked Sendable {
+    private let lock = NSLock()
+    private var urls: [URL] = []
+
+    init(urls: [URL] = []) {
+        self.urls = urls
+    }
+
+    var current: [URL] {
+        lock.lock()
+        defer { lock.unlock() }
+        return urls
+    }
+
+    func set(_ newURLs: [URL]) {
+        lock.lock()
+        urls = newURLs
+        lock.unlock()
     }
 }

@@ -52,8 +52,29 @@ final class USBManager: ObservableObject {
     /// Dedicated queue for the blocking protocol loop — `USBManager` is `@MainActor`,
     /// so every USB read/write must run off the main thread.
     private let serveQueue = DispatchQueue(label: "com.sendo.usb.serve", qos: .userInitiated)
-    /// True while a `serve(files:)` session is in flight.
+    /// True while a `serve(...)` session is in flight.
     private var isServing = false
+    /// Identity of the CURRENT serve session.
+    ///
+    /// Bumped on every `beginServing()` and on every disconnect, so a session
+    /// that ends after it was superseded — or after its device went away —
+    /// can never mutate queue state or raise an alert on its successor's
+    /// behalf (W1).
+    private var sessionToken: UInt64 = 0
+    /// Serve failures in a row. Only the FIRST one of a run raises the alert,
+    /// so a flaky link cannot stack error dialogs (W5).
+    private var consecutiveSessionFailures = 0
+    /// Delay before restarting a session that ENDED WITH AN ERROR. Completed
+    /// and idle sessions restart immediately: a failure means the Switch is
+    /// misbehaving, so back off before offering a session again.
+    private let restartBackoff: TimeInterval = 1.0
+    /// Install queue handed to `serve(...)`; the protocol reads it AT HANDSHAKE
+    /// TIME, so the box — not a snapshot — keeps the served list fresh.
+    private let installFiles = InstallFileList()
+    /// Paths the CURRENT session latched into its string table. Only those can
+    /// legitimately be marked as completed when the session ends — an item
+    /// queued after the latch is served by the NEXT session instead.
+    private var latchedPaths: Set<String> = []
     
     private init() {
         let defaults = UserDefaults.standard
@@ -92,13 +113,14 @@ final class USBManager: ObservableObject {
                         self.connectionStatus = "Conectado: \(device.name)"
                         self.isConnected = true
                         self.phairaClient = client
+                        self.consecutiveSessionFailures = 0
                         
                         // Serving the queue exactly as it stands right now (possibly
                         // empty) is valid: the Switch receives an empty string table,
                         // shows nothing, sends CMD_QUIT and the loop exits cleanly.
-                        let files = self.installQueue.map { URL(fileURLWithPath: $0.file.path) }
-                        SenDoLog.log("USBManager: starting serve on connect with \(files.count) file(s) from installQueue")
-                        self.beginServing(files: files)
+                        // The session then restarts on its own and re-reads the queue.
+                        self.syncInstallFiles()
+                        self.beginServing()
                     }
                 } catch {
                     SenDoLog.log("USBManager: USB connection error: \(error)")
@@ -113,15 +135,21 @@ final class USBManager: ObservableObject {
         
         usbDiscovery?.onDeviceDisconnected = { [weak self] in
             DispatchQueue.main.async {
+                guard let self else { return }
                 SenDoLog.log("USBManager: device disconnected — dropping Sphaira client")
-                self?.connectionStatus = "Desconectado"
-                self?.isConnected = false
-                self?.phairaClient = nil
-                self?.isServing = false
+                self.connectionStatus = "Desconectado"
+                self.isConnected = false
+                self.phairaClient = nil
+                // Invalidate the in-flight session: when its blocking read
+                // finally fails, the stale result must not touch queue state
+                // or raise an alert (W1).
+                self.sessionToken &+= 1
+                self.isServing = false
+                self.consecutiveSessionFailures = 0
                 // `availableFiles` is a disk-backed ROM list now — unplugging the
                 // Switch must not wipe the user's library.
-                self?.backupActivity = nil
-                self?.backupBytes = 0
+                self.backupActivity = nil
+                self.backupBytes = 0
             }
         }
         
@@ -212,32 +240,61 @@ final class USBManager: ObservableObject {
     
     // MARK: - Serve Loop
     
+    /// Outcome of one serve session, as seen by the protocol loop.
+    private enum SessionOutcome {
+        /// CMD_QUIT — the Switch walked away cleanly.
+        case completed
+        /// No session-opening packet (or a quiet link) — the normal state
+        /// BETWEEN two sessions, never a failure.
+        case idle
+        case failed(String)
+    }
+    
+    /// Publishes the current queue to the serving loop, which reads it at
+    /// handshake time. Called after every queue mutation.
+    private func syncInstallFiles() {
+        installFiles.set(installQueue.map { URL(fileURLWithPath: $0.file.path) })
+    }
+    
     /// Starts the blocking Sphaira server loop on `serveQueue`.
-    /// Returns `false` when a session is already running (the file list of a
-    /// session is fixed at handshake time, so it cannot be swapped mid-flight).
+    /// Returns `false` when no client is connected or a session is already
+    /// running (the string table of a session is fixed at handshake time).
     @discardableResult
-    private func beginServing(files: [URL]) -> Bool {
+    private func beginServing() -> Bool {
         guard let client = phairaClient else {
             SenDoLog.log("USBManager: beginServing — no Sphaira client")
             return false
         }
         guard !isServing else {
-            SenDoLog.log("USBManager: beginServing — a serve session is already active, file list is fixed for this session")
+            SenDoLog.log("USBManager: beginServing — a serve session is already active, the file list is refreshed on the next handshake")
             return false
         }
         
         isServing = true
+        sessionToken &+= 1
+        let token = sessionToken
+        // Nothing is latched yet: a session that never reaches the INSTALL
+        // handshake (export, or an idle timeout) must not touch queue rows.
+        latchedPaths = []
+        syncInstallFiles()
+        let files = installFiles
         let backupRoot = URL(fileURLWithPath: backupFolder, isDirectory: true)
-        SenDoLog.log("USBManager: serve session starting — \(files.count) file(s), backup root \(backupRoot.path)")
+        SenDoLog.log("USBManager: serve session #\(token) starting — \(files.current.count) file(s) in the queue, backup root \(backupRoot.path)")
         
         serveQueue.async { [weak self] in
             do {
                 try client.serve(
                     files: files,
                     backupRoot: backupRoot,
-                    onProgress: { bytesSent, totalBytes, currentFileName in
+                    onHandshake: { latched in
                         DispatchQueue.main.async { [weak self] in
-                            self?.updateServeProgress(fileName: currentFileName, bytesSent: bytesSent, totalBytes: totalBytes)
+                            self?.latchedPaths = Set(latched.map(\.path))
+                            SenDoLog.log("USBManager: session #\(token) latched \(latched.count) file(s) into its string table")
+                        }
+                    },
+                    onProgress: { bytesSent, totalBytes, currentFilePath in
+                        DispatchQueue.main.async { [weak self] in
+                            self?.updateServeProgress(filePath: currentFilePath, bytesSent: bytesSent, totalBytes: totalBytes)
                         }
                     },
                     onExportProgress: { bytesReceived, currentFileName in
@@ -246,34 +303,66 @@ final class USBManager: ObservableObject {
                         }
                     }
                 )
-                SenDoLog.log("USBManager: serve session ended cleanly (CMD_QUIT)")
+                SenDoLog.log("USBManager: serve session #\(token) ended cleanly (CMD_QUIT)")
                 DispatchQueue.main.async { [weak self] in
-                    self?.finishServing(success: true, message: nil)
+                    self?.finishServing(token: token, outcome: .completed)
                 }
             } catch {
-                SenDoLog.log("USBManager: serve session ended with error: \(error)")
-                let isTimeout: Bool
-                if let usbError = error as? USBTransferError, case .timeout = usbError {
-                    isTimeout = true
-                } else {
-                    isTimeout = false
-                }
+                SenDoLog.log("USBManager: serve session #\(token) ended with error: \(error)")
                 DispatchQueue.main.async { [weak self] in
-                    if isTimeout {
-                        // The Switch simply went quiet — expected between sessions.
-                        self?.finishServing(success: false, message: "La Switch dejó de responder")
-                    } else {
-                        self?.finishServing(success: false, message: error.localizedDescription)
-                    }
+                    self?.finishServing(token: token, outcome: Self.classify(error))
                 }
             }
         }
         return true
     }
     
-    private func updateServeProgress(fileName: String, bytesSent: Int64, totalBytes: Int64) {
+    /// Maps a protocol error to a session outcome, with Spanish UI copy.
+    /// Pure: safe to call from the serving thread.
+    private nonisolated static func classify(_ error: Error) -> SessionOutcome {
+        if let spairaError = error as? SphairaProtocolError {
+            switch spairaError {
+            case .sessionIdle:
+                return .idle
+            case .exportInterrupted:
+                return .failed("La exportación se interrumpió: uno o más archivos quedaron incompletos")
+            default:
+                return .failed(spairaError.localizedDescription)
+            }
+        }
+        if let usbError = error as? USBTransferError, case .timeout = usbError {
+            // The Switch simply went quiet — expected between sessions.
+            return .idle
+        }
+        return .failed(error.localizedDescription)
+    }
+    
+    /// Runs the next session while the Switch is still connected. The token is
+    /// re-checked at fire time, so a disconnect in between can never start a
+    /// session against a closed device (W1).
+    private func scheduleRestart(after delay: TimeInterval, token: UInt64) {
+        guard delay <= 0 else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.restartIfNeeded(token: token)
+            }
+            return
+        }
+        restartIfNeeded(token: token)
+    }
+    
+    private func restartIfNeeded(token: UInt64) {
+        guard sessionToken == token, isConnected, phairaClient != nil, !isServing else {
+            SenDoLog.log("USBManager: serve session #\(token) not restarted — connection state changed")
+            return
+        }
+        beginServing()
+    }
+    
+    private func updateServeProgress(filePath: String, bytesSent: Int64, totalBytes: Int64) {
+        // Match by FULL path: the queue can hold two games whose
+        // `lastPathComponent` is identical.
         guard let index = installQueue.firstIndex(where: {
-            $0.status == .installing && URL(fileURLWithPath: $0.file.path).lastPathComponent == fileName
+            $0.status == .installing && $0.file.path == filePath
         }) else { return }
         if totalBytes > 0 {
             installQueue[index].progress = min(1.0, Double(bytesSent) / Double(totalBytes))
@@ -293,27 +382,66 @@ final class USBManager: ObservableObject {
         }
     }
     
-    private func finishServing(success: Bool, message: String?) {
+    /// Ends the session identified by `token` and — if that session is still
+    /// the current one — applies its outcome to the queue, raises the alert
+    /// (first failure of a run only) and schedules the next session.
+    private func finishServing(token: UInt64, outcome: SessionOutcome) {
+        guard token == sessionToken else {
+            // Superseded (or its device is gone): its result belongs to nobody.
+            SenDoLog.log("USBManager: ignoring stale serve session #\(token) result (current session is #\(sessionToken))")
+            return
+        }
+        
         isServing = false
         backupActivity = nil
         backupBytes = 0
         lastLoggedBackupFile = nil
         
-        for index in installQueue.indices where installQueue[index].status == .installing {
-            if success {
+        switch outcome {
+        case .completed:
+            consecutiveSessionFailures = 0
+            // Only what THIS session latched can be completed: an item queued
+            // after the handshake is served by the next session, and marking
+            // it now would report a transfer that never happened.
+            for index in installQueue.indices
+            where installQueue[index].status == .installing
+                && latchedPaths.contains(installQueue[index].file.path) {
                 installQueue[index].status = .completed
                 installQueue[index].progress = 1.0
                 completedInstalls.append(installQueue[index])
-            } else {
-                installQueue[index].status = .failed
-                installQueue[index].errorMessage = message ?? "Sesión USB terminada"
             }
-        }
-        installQueue.removeAll { $0.status == .completed }
-        
-        if let message = message, !success {
-            errorMessage = message
-            showError = true
+            installQueue.removeAll { $0.status == .completed }
+            syncInstallFiles()
+            SenDoLog.log("USBManager: serve session #\(token) completed (\(latchedPaths.count) file(s) latched)")
+            scheduleRestart(after: 0, token: token)
+            
+        case .idle:
+            // Between sessions: the queue is left exactly as it was, and the
+            // next session simply offers the list again.
+            consecutiveSessionFailures = 0
+            syncInstallFiles()
+            scheduleRestart(after: 0, token: token)
+            
+        case .failed(let message):
+            // An error is reported against everything the session latched; rows
+            // it never latched keep their state and are picked up by the next
+            // session. Anything pending a retry is flipped back by the next
+            // `startInstallation`.
+            for index in installQueue.indices
+            where installQueue[index].status == .installing
+                && latchedPaths.contains(installQueue[index].file.path) {
+                installQueue[index].status = .failed
+                installQueue[index].errorMessage = message
+            }
+            syncInstallFiles()
+            consecutiveSessionFailures += 1
+            if consecutiveSessionFailures == 1 {
+                errorMessage = message
+                showError = true
+            } else {
+                SenDoLog.log("USBManager: serve session #\(token) failed again (\(consecutiveSessionFailures) in a row) — suppressing further alerts")
+            }
+            scheduleRestart(after: restartBackoff, token: token)
         }
     }
     
@@ -328,13 +456,18 @@ final class USBManager: ObservableObject {
                 progress: 0
             ))
         }
+        syncInstallFiles()
     }
     
     func removeFromQueue(_ taskId: String) {
         installQueue.removeAll { $0.id == taskId }
+        syncInstallFiles()
     }
     
-    func clearQueue() { installQueue.removeAll() }
+    func clearQueue() {
+        installQueue.removeAll()
+        syncInstallFiles()
+    }
     
     func addSelectedToQueue() {
         let selected = availableFiles.filter { selectedFiles.contains($0.id) }
@@ -351,11 +484,6 @@ final class USBManager: ObservableObject {
             return
         }
         
-        guard !isServing else {
-            SenDoLog.log("USBManager: startInstallation — serve session already active, file list is fixed for this session")
-            return
-        }
-        
         let pendingCount = installQueue.filter { $0.status == .pending || $0.status == .failed }.count
         guard pendingCount > 0 else {
             SenDoLog.log("USBManager: startInstallation — nothing pending in the queue")
@@ -367,10 +495,17 @@ final class USBManager: ObservableObject {
             installQueue[i].status = .installing
             installQueue[i].progress = 0
         }
+        syncInstallFiles()
+        SenDoLog.log("USBManager: startInstallation — \(pendingCount) file(s) marked as installing")
         
-        let files = installQueue.map { URL(fileURLWithPath: $0.file.path) }
-        SenDoLog.log("USBManager: startInstallation — serving \(files.count) file(s)")
-        beginServing(files: files)
+        // A session that is already serving latched its string table at
+        // handshake time; the refreshed list is picked up by the session that
+        // follows it, which starts as soon as the current one ends.
+        if isServing {
+            SenDoLog.log("USBManager: startInstallation — serve session already active, refreshed list is served on the next handshake")
+            return
+        }
+        beginServing()
     }
     
     func toggleSelection(for fileId: String) {

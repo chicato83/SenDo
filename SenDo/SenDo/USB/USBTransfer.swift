@@ -269,7 +269,10 @@ final class USBTransfer {
             }
 
             totalRead += request.bytesRead
-            SenDoLog.log("USBTransfer: read \(request.bytesRead) bytes (progress \(totalRead)/\(count))")
+            // No per-partial-read log: a single `readExact` can complete
+            // hundreds of small transfers, and logging each one floods
+            // /tmp/sendo.log (W4). The `readExact done` line below is the
+            // single per-call record.
         }
 
         SenDoLog.log("USBTransfer: readExact done — \(count) bytes")

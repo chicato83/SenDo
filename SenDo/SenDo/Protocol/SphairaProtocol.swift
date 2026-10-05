@@ -301,6 +301,13 @@ enum SphairaProtocolError: LocalizedError {
     case fileOpenFailed(String)
     case invalidExportPath(String)
     case unexpectedEndOfFile(expected: Int, got: Int)
+    /// The Switch never sent the session-opening packet within the handshake
+    /// timeout. This is the normal idle state between two sessions, so it is
+    /// tracked separately: the UI must not report it as a failure.
+    case sessionIdle
+    /// The export session closed cleanly but at least one file lost chunks
+    /// (CRC mismatch or write error), so what landed on disk is incomplete.
+    case exportInterrupted
 
     var errorDescription: String? {
         switch self {
@@ -320,6 +327,10 @@ enum SphairaProtocolError: LocalizedError {
             return "Rejected export path from Switch: \(path)"
         case .unexpectedEndOfFile(let expected, let got):
             return "Unexpected end of file: wanted \(expected) bytes, got \(got)"
+        case .sessionIdle:
+            return "No session-opening packet from the Switch (idle session)"
+        case .exportInterrupted:
+            return "Export interrupted — one or more exported files are incomplete"
         }
     }
 }

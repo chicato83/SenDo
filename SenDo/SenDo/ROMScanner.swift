@@ -13,8 +13,9 @@ enum ROMScanner {
 
     /// `[010070201D1BA000]` -> `010070201D1BA000`.
     private static let titleIdRegex = try! NSRegularExpression(pattern: "\\[([0-9A-Fa-f]{16})\\]")
-    /// `[v589824]` -> `589824`.
-    private static let versionRegex = try! NSRegularExpression(pattern: "\\[v(\\d+)\\]")
+    /// `[v589824]` -> `589824`. Case-insensitive: title managers also write
+    /// `[V589824]`.
+    private static let versionRegex = try! NSRegularExpression(pattern: "(?i)\\[v(\\d+)\\]")
 
     /// Returns every supported file below `folderPath`, hidden items excluded.
     static func scan(folderPath: String) -> [GameFile] {
